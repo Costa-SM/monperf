@@ -34,7 +34,7 @@ use std::time::Duration;
 
 /// Performance monitoring CLI for identifying system bottlenecks
 #[derive(Parser, Debug)]
-#[command(name = "perf-monitor")]
+#[command(name = "monperf")]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Process ID to monitor (optional)

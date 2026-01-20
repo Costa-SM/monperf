@@ -1,4 +1,4 @@
-# perf-monitor
+# monperf
 
 A real-time Linux performance monitoring tool with a terminal UI (TUI), designed for tracking system and process metrics during data pipeline execution.
 
@@ -34,20 +34,21 @@ All major sections include real-time sparkline graphs showing historical trends:
 ## Installation
 
 ### From Release
-Download the pre-built binary from [Releases](../../releases):
+Download the pre-built binary from [Releases](https://github.com/Costa-SM/monperf/releases):
 
 ```bash
 # Linux x86_64 (glibc)
-wget https://github.com/<org>/<repo>/releases/latest/download/perf-monitor-linux-x86_64
-chmod +x perf-monitor-linux-x86_64
-./perf-monitor-linux-x86_64
+wget https://github.com/Costa-SM/monperf/releases/latest/download/monperf-linux-x86_64
+chmod +x monperf-linux-x86_64
+./monperf-linux-x86_64
 ```
 
 ### From Source
 ```bash
-cd perf-monitor
+git clone https://github.com/Costa-SM/monperf.git
+cd monperf
 cargo build --release
-./target/release/perf-monitor
+./target/release/monperf
 ```
 
 ## Usage
@@ -55,32 +56,32 @@ cargo build --release
 ### Basic TUI Mode
 ```bash
 # Launch interactive TUI
-./perf-monitor
+./monperf
 
 # Monitor with logging
-./perf-monitor -l metrics.json -o observations.txt
+./monperf -l metrics.json -o observations.txt
 ```
 
 ### Monitor a Specific Process
 ```bash
 # By PID
-./perf-monitor -p 12345
+./monperf -p 12345
 
 # By name pattern (auto-discovers process)
-./perf-monitor -n "duckprep.py"
-./perf-monitor -n "python.*my_script"
+./monperf -n "duckprep.py"
+./monperf -n "python.*my_script"
 ```
 
 ### Headless Mode (No TUI)
 ```bash
 # Run for 60 seconds, collect 60 samples
-./perf-monitor --no-tui -d 60 -l metrics.json -o observations.txt
+./monperf --no-tui -d 60 -l metrics.json -o observations.txt
 ```
 
 ### Generate Plots from Logs
 ```bash
 # Generate SVG plots from a JSON log file
-./perf-monitor plot metrics.json --output-dir ./plots
+./monperf plot metrics.json --output-dir ./plots
 ```
 
 ## Command Line Options

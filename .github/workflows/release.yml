@@ -18,18 +18,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact_name: perf-monitor
-            asset_name: perf-monitor-linux-x86_64
+            artifact_name: monperf
+            asset_name: monperf-linux-x86_64
 
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact_name: perf-monitor
-            asset_name: perf-monitor-linux-x86_64-musl
+            artifact_name: monperf
+            asset_name: monperf-linux-x86_64-musl
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact_name: perf-monitor
-            asset_name: perf-monitor-linux-aarch64
+            artifact_name: monperf
+            asset_name: monperf-linux-aarch64
 
     steps:
       - name: Checkout
@@ -58,21 +58,20 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           fi
           cargo build --release --target ${{ matrix.target }}
-        working-directory: perf-monitor
 
       - name: Strip binary
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: strip perf-monitor/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
       - name: Strip binary (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: aarch64-linux-gnu-strip perf-monitor/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: perf-monitor/target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
 
   release:
     name: Create Release
@@ -94,7 +93,7 @@ jobs:
           mkdir -p release
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            cp "$dir"perf-monitor "release/$name"
+            cp "$dir"monperf "release/$name"
             chmod +x "release/$name"
           done
           ls -la release/
@@ -110,21 +109,21 @@ jobs:
           echo "" >> CHANGELOG.md
           echo "| Platform | Binary |" >> CHANGELOG.md
           echo "|----------|--------|" >> CHANGELOG.md
-          echo "| Linux x86_64 (glibc) | \`perf-monitor-linux-x86_64\` |" >> CHANGELOG.md
-          echo "| Linux x86_64 (musl/static) | \`perf-monitor-linux-x86_64-musl\` |" >> CHANGELOG.md
-          echo "| Linux ARM64 | \`perf-monitor-linux-aarch64\` |" >> CHANGELOG.md
+          echo "| Linux x86_64 (glibc) | \`monperf-linux-x86_64\` |" >> CHANGELOG.md
+          echo "| Linux x86_64 (musl/static) | \`monperf-linux-x86_64-musl\` |" >> CHANGELOG.md
+          echo "| Linux ARM64 | \`monperf-linux-aarch64\` |" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           echo "### Usage" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           echo "\`\`\`bash" >> CHANGELOG.md
           echo "# Download and make executable" >> CHANGELOG.md
-          echo "chmod +x perf-monitor-linux-x86_64" >> CHANGELOG.md
+          echo "chmod +x monperf-linux-x86_64" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           echo "# Run with TUI" >> CHANGELOG.md
-          echo "./perf-monitor-linux-x86_64" >> CHANGELOG.md
+          echo "./monperf-linux-x86_64" >> CHANGELOG.md
           echo "" >> CHANGELOG.md
           echo "# Monitor a specific process and log to file" >> CHANGELOG.md
-          echo "./perf-monitor-linux-x86_64 -n 'python' -l metrics.json -o observations.txt" >> CHANGELOG.md
+          echo "./monperf-linux-x86_64 -n 'python' -l metrics.json -o observations.txt" >> CHANGELOG.md
           echo "\`\`\`" >> CHANGELOG.md
 
       - name: Create Release

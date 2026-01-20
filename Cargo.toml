@@ -1,7 +1,10 @@
 [package]
-name = "perf-monitor"
+name = "monperf"
 version = "0.1.0"
 edition = "2021"
+description = "Real-time Linux performance monitoring with TUI"
+repository = "https://github.com/Costa-SM/monperf"
+license = "MIT"
 
 [dependencies]
 # CLI argument parsing

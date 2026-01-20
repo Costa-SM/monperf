@@ -309,7 +309,7 @@ fn read_process_io(proc_path: &str) -> (u64, u64, u64, u64, u64) {
 
 /// Find a process by name or command-line pattern (returns best match)
 /// Matches against both /proc/PID/comm and /proc/PID/cmdline
-/// Excludes perf-monitor processes to avoid matching ourselves
+/// Excludes monperf processes to avoid matching ourselves
 pub fn find_process_by_name(pattern: &str) -> Option<u32> {
     let proc_dir = Path::new("/proc");
     let pattern_lower = pattern.to_lowercase();
@@ -334,8 +334,8 @@ pub fn find_process_by_name(pattern: &str) -> Option<u32> {
                     let cmdline_clean = cmdline.replace('\0', " ");
                     let cmdline_lower = cmdline_clean.to_lowercase();
                     
-                    // Skip perf-monitor processes (including other instances)
-                    if cmdline_lower.contains("perf-monitor") {
+                    // Skip monperf processes (including other instances)
+                    if cmdline_lower.contains("monperf") {
                         continue;
                     }
                     
