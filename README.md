@@ -91,7 +91,8 @@ cargo build --release
 | `-p, --pid <PID>` | Monitor a specific process by PID |
 | `-n, --name <PATTERN>` | Monitor process matching name/cmdline pattern |
 | `-l, --log <FILE>` | Write JSON metrics to file |
-| `-o, --observations <FILE>` | Write human-readable log to file |
+| `-o, --observations <FILE>` | Write human-readable log to file (compact) |
+| `--detailed-log <FILE>` | Write detailed CSV with all metrics (per-core, per-disk, per-interface) |
 | `-i, --interval <MS>` | Sampling interval in milliseconds (default: 1000) |
 | `-d, --duration <SECS>` | Run for N seconds then exit |
 | `--no-tui` | Disable TUI, print to stdout |

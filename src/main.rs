@@ -20,7 +20,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use display::{format_bytes, format_throughput, CpuHistory, DiskHistory, MemoryHistory, NetworkHistory};
-use logging::{MetricsLogger, MetricsSample, SummaryAccumulator, TextLogger};
+use logging::{DetailedTextLogger, MetricsLogger, MetricsSample, SummaryAccumulator, TextLogger};
 use metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics};
 use process::{ProcessCollector, ProcessMetrics};
 use ratatui::{
@@ -56,6 +56,10 @@ struct Args {
     /// Log metrics to file (human-readable text format)
     #[arg(short = 'o', long)]
     text_log: Option<PathBuf>,
+
+    /// Log metrics to file (detailed human-readable format with all metrics)
+    #[arg(long)]
+    detailed_log: Option<PathBuf>,
 
     /// Spill directory to monitor for size
     #[arg(short, long)]
@@ -131,6 +135,7 @@ struct App {
 
     logger: Option<MetricsLogger>,
     text_logger: Option<TextLogger>,
+    detailed_logger: Option<DetailedTextLogger>,
     accumulator: SummaryAccumulator,
 
     uptime_secs: u64,
@@ -146,6 +151,7 @@ struct App {
     // Log rotation settings
     json_log_base: Option<PathBuf>,
     text_log_base: Option<PathBuf>,
+    detailed_log_base: Option<PathBuf>,
     log_segment: u32,
     pending_log_split: bool,  // Confirmation state for log split
     status_message: Option<(String, std::time::Instant)>,  // Temporary status message
@@ -201,6 +207,13 @@ impl App {
             None
         };
 
+        // Setup detailed logger
+        let detailed_logger = if let Some(ref log_path) = args.detailed_log {
+            Some(DetailedTextLogger::new(log_path)?)
+        } else {
+            None
+        };
+
         // Setup alert thresholds
         let thresholds = AlertThresholds {
             cpu_warn: args.cpu_warn,
@@ -232,6 +245,7 @@ impl App {
             alerts: Vec::new(),
             logger,
             text_logger,
+            detailed_logger,
             accumulator: SummaryAccumulator::new(),
             uptime_secs: 0,
             samples_collected: 0,
@@ -242,6 +256,7 @@ impl App {
             current_monitored_pid: current_pid,
             json_log_base: args.log_file.clone(),
             text_log_base: args.text_log.clone(),
+            detailed_log_base: args.detailed_log.clone(),
             log_segment: 0,
             pending_log_split: false,
             status_message: None,
@@ -355,7 +370,7 @@ impl App {
                 };
                 
                 // Only split if logging is configured
-                if self.json_log_base.is_some() || self.text_log_base.is_some() {
+                if self.json_log_base.is_some() || self.text_log_base.is_some() || self.detailed_log_base.is_some() {
                     if let Err(e) = self.rotate_logs() {
                         let msg = format!("Auto-split failed on {}: {}", event, e);
                         if self.tui_mode {
@@ -428,6 +443,15 @@ impl App {
                         }
                     }
                 }
+                if let Some(ref mut detailed_logger) = self.detailed_logger {
+                    if let Err(e) = detailed_logger.log(&sample) {
+                        if self.tui_mode {
+                            self.set_status(&format!("Detailed log error: {}", e));
+                        } else {
+                            eprintln!("Detailed log error: {}", e);
+                        }
+                    }
+                }
             }
 
             self.accumulator.add_sample(sample);
@@ -457,6 +481,15 @@ impl App {
             self.text_logger = Some(TextLogger::new(&new_path)?);
             if !self.tui_mode {
                 eprintln!("Started new text log: {}", new_path.display());
+            }
+        }
+        
+        // Rotate detailed log
+        if let Some(ref base_path) = self.detailed_log_base {
+            let new_path = Self::segment_path(base_path, segment);
+            self.detailed_logger = Some(DetailedTextLogger::new(&new_path)?);
+            if !self.tui_mode {
+                eprintln!("Started new detailed log: {}", new_path.display());
             }
         }
         
@@ -502,8 +535,9 @@ impl App {
 
     /// Get current log file name for display
     fn current_log_name(&self) -> Option<String> {
-        // Prefer text log name, fall back to JSON log name
-        let base = self.text_log_base.as_ref()
+        // Prefer detailed log name, then text log, then JSON log
+        let base = self.detailed_log_base.as_ref()
+            .or(self.text_log_base.as_ref())
             .or(self.json_log_base.as_ref())?;
         
         let path = if self.log_segment == 0 {
@@ -779,10 +813,10 @@ fn run_tui(mut app: App, interval: Duration, duration: Option<Duration>) -> Resu
                             }
                             KeyCode::Char('s') => {
                                 // Check if logging is configured
-                                if app.json_log_base.is_some() || app.text_log_base.is_some() {
+                                if app.json_log_base.is_some() || app.text_log_base.is_some() || app.detailed_log_base.is_some() {
                                     app.pending_log_split = true;
                                 } else {
-                                    app.set_status("No log files configured (-l or -o)");
+                                    app.set_status("No log files configured (-l, -o, or --detailed-log)");
                                 }
                             }
                             _ => {}
@@ -884,6 +918,9 @@ async fn main() -> Result<()> {
     }
     if let Some(ref log_path) = args.text_log {
         eprintln!("Text observations logged to: {}", log_path.display());
+    }
+    if let Some(ref log_path) = args.detailed_log {
+        eprintln!("Detailed metrics logged to: {}", log_path.display());
     }
 
     Ok(())

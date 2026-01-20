@@ -1,6 +1,6 @@
 //! Historical logging module for writing metrics to files.
 
-use crate::display::{format_bytes, format_bytes_short, format_throughput, truncate_str};
+use crate::display::{format_bytes_short, format_throughput};
 use crate::metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics, PsiMetrics};
 use crate::process::ProcessMetrics;
 use anyhow::{Context, Result};
@@ -210,6 +210,358 @@ impl TextLogger {
 }
 
 impl Drop for TextLogger {
+    fn drop(&mut self) {
+        let _ = self.writer.flush();
+    }
+}
+
+/// Detailed CSV logger for writing comprehensive metrics to a CSV file
+/// Includes per-core CPU, per-disk I/O, per-interface network, and full PSI breakdown
+pub struct DetailedTextLogger {
+    writer: BufWriter<File>,
+    samples_written: u64,
+    header_written: bool,
+    // Track device names from first sample for consistent columns
+    core_ids: Vec<usize>,
+    disk_devices: Vec<String>,
+    interface_names: Vec<String>,
+}
+
+impl DetailedTextLogger {
+    /// Create a new detailed CSV logger writing to the specified file
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path.as_ref())
+            .context("Failed to create detailed CSV file")?;
+
+        Ok(Self {
+            writer: BufWriter::new(file),
+            samples_written: 0,
+            header_written: false,
+            core_ids: Vec::new(),
+            disk_devices: Vec::new(),
+            interface_names: Vec::new(),
+        })
+    }
+
+    /// Write CSV header based on the first sample's structure
+    fn write_header(&mut self, sample: &MetricsSample) -> Result<()> {
+        // Capture device names from first sample
+        self.core_ids = sample.cpu.per_core.iter().map(|c| c.core_id).collect();
+        self.disk_devices = sample.disk.disks.iter().map(|d| d.device.clone()).collect();
+        self.interface_names = sample.network.interfaces.iter().map(|i| i.interface.clone()).collect();
+
+        let mut headers = vec![
+            // Timestamp
+            "timestamp".to_string(),
+            // CPU aggregate
+            "cpu_total_pct".to_string(),
+            "cpu_user_pct".to_string(),
+            "cpu_system_pct".to_string(),
+            "cpu_iowait_pct".to_string(),
+            "cpu_load_1m".to_string(),
+            "cpu_load_5m".to_string(),
+            "cpu_load_15m".to_string(),
+            "cpu_context_switches".to_string(),
+            "cpu_interrupts".to_string(),
+        ];
+
+        // Per-core CPU columns
+        for core_id in &self.core_ids {
+            headers.push(format!("cpu_core{}_pct", core_id));
+        }
+
+        // Memory columns
+        headers.extend(vec![
+            "mem_total_bytes".to_string(),
+            "mem_used_bytes".to_string(),
+            "mem_available_bytes".to_string(),
+            "mem_used_pct".to_string(),
+            "mem_buffers_bytes".to_string(),
+            "mem_cached_bytes".to_string(),
+            "mem_dirty_bytes".to_string(),
+            "mem_writeback_bytes".to_string(),
+            "mem_active_file_bytes".to_string(),
+            "mem_inactive_file_bytes".to_string(),
+            "mem_swap_total_bytes".to_string(),
+            "mem_swap_used_bytes".to_string(),
+            "mem_swap_pct".to_string(),
+            "mem_major_faults".to_string(),
+            "mem_minor_faults".to_string(),
+            "cgroup_limit_bytes".to_string(),
+            "cgroup_current_bytes".to_string(),
+            "cgroup_usage_pct".to_string(),
+        ]);
+
+        // Disk aggregate columns
+        headers.extend(vec![
+            "disk_total_read_bytes_per_sec".to_string(),
+            "disk_total_write_bytes_per_sec".to_string(),
+            "disk_total_in_flight".to_string(),
+        ]);
+
+        // Per-disk columns
+        for dev in &self.disk_devices {
+            headers.push(format!("disk_{}_read_bytes_per_sec", dev));
+            headers.push(format!("disk_{}_write_bytes_per_sec", dev));
+            headers.push(format!("disk_{}_read_iops", dev));
+            headers.push(format!("disk_{}_write_iops", dev));
+            headers.push(format!("disk_{}_read_latency_ms", dev));
+            headers.push(format!("disk_{}_write_latency_ms", dev));
+            headers.push(format!("disk_{}_util_pct", dev));
+            headers.push(format!("disk_{}_in_flight", dev));
+        }
+
+        // Network aggregate columns
+        headers.extend(vec![
+            "net_total_rx_bytes_per_sec".to_string(),
+            "net_total_tx_bytes_per_sec".to_string(),
+            "net_tcp_connections".to_string(),
+            "net_tcp_retransmits".to_string(),
+        ]);
+
+        // Per-interface columns
+        for iface in &self.interface_names {
+            headers.push(format!("net_{}_rx_bytes_per_sec", iface));
+            headers.push(format!("net_{}_tx_bytes_per_sec", iface));
+            headers.push(format!("net_{}_rx_packets_per_sec", iface));
+            headers.push(format!("net_{}_tx_packets_per_sec", iface));
+            headers.push(format!("net_{}_rx_errors", iface));
+            headers.push(format!("net_{}_tx_errors", iface));
+        }
+
+        // PSI columns
+        headers.extend(vec![
+            "psi_cpu_some_avg10".to_string(),
+            "psi_cpu_some_avg60".to_string(),
+            "psi_cpu_some_avg300".to_string(),
+            "psi_mem_some_avg10".to_string(),
+            "psi_mem_some_avg60".to_string(),
+            "psi_mem_some_avg300".to_string(),
+            "psi_mem_full_avg10".to_string(),
+            "psi_mem_full_avg60".to_string(),
+            "psi_mem_full_avg300".to_string(),
+            "psi_io_some_avg10".to_string(),
+            "psi_io_some_avg60".to_string(),
+            "psi_io_some_avg300".to_string(),
+            "psi_io_full_avg10".to_string(),
+            "psi_io_full_avg60".to_string(),
+            "psi_io_full_avg300".to_string(),
+        ]);
+
+        // Process columns (always included, may be empty)
+        headers.extend(vec![
+            "proc_pid".to_string(),
+            "proc_name".to_string(),
+            "proc_state".to_string(),
+            "proc_cpu_pct".to_string(),
+            "proc_threads".to_string(),
+            "proc_fds".to_string(),
+            "proc_rss_bytes".to_string(),
+            "proc_vsize_bytes".to_string(),
+            "proc_vm_peak_bytes".to_string(),
+            "proc_rss_anon_bytes".to_string(),
+            "proc_rss_file_bytes".to_string(),
+            "proc_rss_shmem_bytes".to_string(),
+            "proc_vm_swap_bytes".to_string(),
+            "proc_io_read_bytes_per_sec".to_string(),
+            "proc_io_write_bytes_per_sec".to_string(),
+            "proc_io_read_bytes_total".to_string(),
+            "proc_io_write_bytes_total".to_string(),
+            "proc_io_rchar".to_string(),
+            "proc_io_wchar".to_string(),
+            "proc_io_cancelled_write_bytes".to_string(),
+        ]);
+
+        writeln!(self.writer, "{}", headers.join(","))?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    /// Log a sample as a CSV row
+    pub fn log(&mut self, sample: &MetricsSample) -> Result<()> {
+        // Write header once we have a sample with populated device data
+        // (first sample often has empty lists because rates need two samples)
+        if !self.header_written {
+            // Wait for a sample with actual device data before writing header
+            if sample.disk.disks.is_empty() && sample.network.interfaces.is_empty() {
+                return Ok(()); // Skip this sample, wait for populated data
+            }
+            self.write_header(sample)?;
+        }
+
+        let mut values: Vec<String> = Vec::new();
+
+        // Timestamp
+        values.push(sample.timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string());
+
+        // CPU aggregate
+        values.push(format!("{:.2}", sample.cpu.total_utilization));
+        values.push(format!("{:.2}", sample.cpu.user_percent));
+        values.push(format!("{:.2}", sample.cpu.system_percent));
+        values.push(format!("{:.2}", sample.cpu.iowait_percent));
+        values.push(format!("{:.2}", sample.cpu.load_avg.0));
+        values.push(format!("{:.2}", sample.cpu.load_avg.1));
+        values.push(format!("{:.2}", sample.cpu.load_avg.2));
+        values.push(sample.cpu.context_switches_delta.map(|v| v.to_string()).unwrap_or_default());
+        values.push(sample.cpu.interrupts_delta.map(|v| v.to_string()).unwrap_or_default());
+
+        // Per-core CPU values (match the order from header)
+        for core_id in &self.core_ids {
+            let util = sample.cpu.per_core
+                .iter()
+                .find(|c| c.core_id == *core_id)
+                .map(|c| c.utilization_percent)
+                .unwrap_or(0.0);
+            values.push(format!("{:.2}", util));
+        }
+
+        // Memory values
+        values.push(sample.memory.total.to_string());
+        values.push(sample.memory.used.to_string());
+        values.push(sample.memory.available.to_string());
+        values.push(format!("{:.2}", sample.memory.used_percent));
+        values.push(sample.memory.buffers.to_string());
+        values.push(sample.memory.cached.to_string());
+        values.push(sample.memory.dirty.to_string());
+        values.push(sample.memory.writeback.to_string());
+        values.push(sample.memory.active_file.to_string());
+        values.push(sample.memory.inactive_file.to_string());
+        values.push(sample.memory.swap_total.to_string());
+        values.push(sample.memory.swap_used.to_string());
+        values.push(format!("{:.2}", sample.memory.swap_percent));
+        values.push(sample.memory.major_faults_delta.map(|v| v.to_string()).unwrap_or_default());
+        values.push(sample.memory.minor_faults_delta.map(|v| v.to_string()).unwrap_or_default());
+        values.push(sample.memory.cgroup_limit.map(|v| v.to_string()).unwrap_or_default());
+        values.push(sample.memory.cgroup_current.map(|v| v.to_string()).unwrap_or_default());
+        values.push(sample.memory.cgroup_usage_percent.map(|v| format!("{:.2}", v)).unwrap_or_default());
+
+        // Disk aggregate
+        values.push(format!("{:.2}", sample.disk.total_read_bytes_per_sec));
+        values.push(format!("{:.2}", sample.disk.total_write_bytes_per_sec));
+        values.push(sample.disk.total_in_flight.to_string());
+
+        // Per-disk values (match the order from header)
+        for dev in &self.disk_devices {
+            if let Some(disk) = sample.disk.disks.iter().find(|d| &d.device == dev) {
+                values.push(format!("{:.2}", disk.read_bytes_per_sec));
+                values.push(format!("{:.2}", disk.write_bytes_per_sec));
+                values.push(format!("{:.2}", disk.read_iops));
+                values.push(format!("{:.2}", disk.write_iops));
+                values.push(format!("{:.3}", disk.read_latency_ms));
+                values.push(format!("{:.3}", disk.write_latency_ms));
+                values.push(format!("{:.2}", disk.utilization_percent));
+                values.push(disk.in_flight.to_string());
+            } else {
+                // Device not found in this sample, add empty values
+                for _ in 0..8 {
+                    values.push(String::new());
+                }
+            }
+        }
+
+        // Network aggregate
+        values.push(format!("{:.2}", sample.network.total_rx_bytes_per_sec));
+        values.push(format!("{:.2}", sample.network.total_tx_bytes_per_sec));
+        values.push(sample.network.tcp.connections_established.to_string());
+        values.push(sample.network.tcp.retransmits_delta.map(|v| v.to_string()).unwrap_or_default());
+
+        // Per-interface values (match the order from header)
+        for iface_name in &self.interface_names {
+            if let Some(iface) = sample.network.interfaces.iter().find(|i| &i.interface == iface_name) {
+                values.push(format!("{:.2}", iface.rx_bytes_per_sec));
+                values.push(format!("{:.2}", iface.tx_bytes_per_sec));
+                values.push(format!("{:.2}", iface.rx_packets_per_sec));
+                values.push(format!("{:.2}", iface.tx_packets_per_sec));
+                values.push(iface.rx_errors.to_string());
+                values.push(iface.tx_errors.to_string());
+            } else {
+                // Interface not found in this sample, add empty values
+                for _ in 0..6 {
+                    values.push(String::new());
+                }
+            }
+        }
+
+        // PSI values
+        if let Some(psi) = &sample.psi {
+            values.push(format!("{:.2}", psi.cpu.some_avg10));
+            values.push(format!("{:.2}", psi.cpu.some_avg60));
+            values.push(format!("{:.2}", psi.cpu.some_avg300));
+            values.push(format!("{:.2}", psi.memory.some_avg10));
+            values.push(format!("{:.2}", psi.memory.some_avg60));
+            values.push(format!("{:.2}", psi.memory.some_avg300));
+            values.push(psi.memory.full_avg10.map(|v| format!("{:.2}", v)).unwrap_or_default());
+            values.push(psi.memory.full_avg60.map(|v| format!("{:.2}", v)).unwrap_or_default());
+            values.push(psi.memory.full_avg300.map(|v| format!("{:.2}", v)).unwrap_or_default());
+            values.push(format!("{:.2}", psi.io.some_avg10));
+            values.push(format!("{:.2}", psi.io.some_avg60));
+            values.push(format!("{:.2}", psi.io.some_avg300));
+            values.push(psi.io.full_avg10.map(|v| format!("{:.2}", v)).unwrap_or_default());
+            values.push(psi.io.full_avg60.map(|v| format!("{:.2}", v)).unwrap_or_default());
+            values.push(psi.io.full_avg300.map(|v| format!("{:.2}", v)).unwrap_or_default());
+        } else {
+            // No PSI data, add empty values
+            for _ in 0..15 {
+                values.push(String::new());
+            }
+        }
+
+        // Process values
+        if let Some(proc) = &sample.process {
+            values.push(proc.pid.to_string());
+            // Escape commas and quotes in process name
+            values.push(format!("\"{}\"", proc.name.replace('"', "\"\"")));
+            values.push(proc.state.to_string());
+            values.push(format!("{:.2}", proc.cpu_percent));
+            values.push(proc.num_threads.to_string());
+            values.push(proc.num_fds.to_string());
+            values.push(proc.rss_bytes.to_string());
+            values.push(proc.vsize_bytes.to_string());
+            values.push(proc.vm_peak.to_string());
+            values.push(proc.rss_anon.to_string());
+            values.push(proc.rss_file.to_string());
+            values.push(proc.rss_shmem.to_string());
+            values.push(proc.vm_swap.to_string());
+            values.push(format!("{:.2}", proc.io_read_bytes_per_sec));
+            values.push(format!("{:.2}", proc.io_write_bytes_per_sec));
+            values.push(proc.io_read_bytes.to_string());
+            values.push(proc.io_write_bytes.to_string());
+            values.push(proc.io_rchar.to_string());
+            values.push(proc.io_wchar.to_string());
+            values.push(proc.io_cancelled_write_bytes.to_string());
+        } else {
+            // No process data, add empty values
+            for _ in 0..20 {
+                values.push(String::new());
+            }
+        }
+
+        writeln!(self.writer, "{}", values.join(","))?;
+        self.samples_written += 1;
+
+        // Flush every sample for real-time logging
+        self.writer.flush()?;
+
+        Ok(())
+    }
+
+    /// Flush any buffered data
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Get the number of samples written
+    pub fn samples_written(&self) -> u64 {
+        self.samples_written
+    }
+}
+
+impl Drop for DetailedTextLogger {
     fn drop(&mut self) {
         let _ = self.writer.flush();
     }
