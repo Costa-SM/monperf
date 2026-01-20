@@ -15,8 +15,16 @@ pub struct MemoryMetrics {
     pub available: u64,
     /// Buffer memory in bytes
     pub buffers: u64,
-    /// Cached memory in bytes
+    /// Cached memory in bytes (file-backed page cache)
     pub cached: u64,
+    /// Dirty pages (modified but not yet written to disk) in bytes
+    pub dirty: u64,
+    /// Pages being written back to disk in bytes
+    pub writeback: u64,
+    /// Active file-backed pages in bytes
+    pub active_file: u64,
+    /// Inactive file-backed pages in bytes
+    pub inactive_file: u64,
     /// Swap total in bytes
     pub swap_total: u64,
     /// Swap used in bytes
@@ -65,6 +73,10 @@ impl MemoryCollector {
         let mut available: u64 = 0;
         let mut buffers: u64 = 0;
         let mut cached: u64 = 0;
+        let mut dirty: u64 = 0;
+        let mut writeback: u64 = 0;
+        let mut active_file: u64 = 0;
+        let mut inactive_file: u64 = 0;
         let mut swap_total: u64 = 0;
         let mut swap_free: u64 = 0;
 
@@ -82,6 +94,10 @@ impl MemoryCollector {
                 "MemAvailable:" => available = value,
                 "Buffers:" => buffers = value,
                 "Cached:" => cached = value,
+                "Dirty:" => dirty = value,
+                "Writeback:" => writeback = value,
+                "Active(file):" => active_file = value,
+                "Inactive(file):" => inactive_file = value,
                 "SwapTotal:" => swap_total = value,
                 "SwapFree:" => swap_free = value,
                 _ => {}
@@ -127,6 +143,10 @@ impl MemoryCollector {
             available,
             buffers,
             cached,
+            dirty,
+            writeback,
+            active_file,
+            inactive_file,
             swap_total,
             swap_used,
             cgroup_limit,

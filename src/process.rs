@@ -44,6 +44,16 @@ pub struct ProcessMetrics {
     pub rss_bytes: u64,
     /// Virtual memory size in bytes
     pub vsize_bytes: u64,
+    /// Peak virtual memory size in bytes
+    pub vm_peak: u64,
+    /// Anonymous memory (heap, stack, allocations) in bytes
+    pub rss_anon: u64,
+    /// File-backed memory (mmap'd files) in bytes
+    pub rss_file: u64,
+    /// Shared memory segments in bytes
+    pub rss_shmem: u64,
+    /// Swapped out memory in bytes
+    pub vm_swap: u64,
     /// CPU usage percentage (requires delta calculation)
     pub cpu_percent: f64,
     /// User CPU time in ticks
@@ -56,13 +66,30 @@ pub struct ProcessMetrics {
     pub num_fds: u64,
     /// Process command line
     pub cmdline: String,
+    // I/O counters from /proc/[pid]/io
+    /// Bytes read from storage (actual disk reads)
+    pub io_read_bytes: u64,
+    /// Bytes written to storage
+    pub io_write_bytes: u64,
+    /// Bytes read (includes cache hits)
+    pub io_rchar: u64,
+    /// Bytes written (includes buffered)
+    pub io_wchar: u64,
+    /// Cancelled write bytes
+    pub io_cancelled_write_bytes: u64,
+    /// Read bytes delta (per second)
+    pub io_read_bytes_per_sec: f64,
+    /// Write bytes delta (per second)
+    pub io_write_bytes_per_sec: f64,
 }
 
-/// Process metrics collector with state for CPU calculation
+/// Process metrics collector with state for CPU and I/O calculation
 pub struct ProcessCollector {
     pid: u32,
     prev_utime: Option<u64>,
     prev_stime: Option<u64>,
+    prev_io_read_bytes: Option<u64>,
+    prev_io_write_bytes: Option<u64>,
     prev_time_ms: u64,
     clock_ticks_per_sec: u64,
 }
@@ -73,6 +100,8 @@ impl ProcessCollector {
             pid,
             prev_utime: None,
             prev_stime: None,
+            prev_io_read_bytes: None,
+            prev_io_write_bytes: None,
             prev_time_ms: 0,
             clock_ticks_per_sec: unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 },
         }
@@ -153,9 +182,40 @@ impl ProcessCollector {
             .trim()
             .to_string();
 
+        // Read /proc/[pid]/status for memory breakdown
+        let (vm_peak, rss_anon, rss_file, rss_shmem, vm_swap) = 
+            read_process_status(&proc_path);
+
+        // Read /proc/[pid]/io for I/O counters
+        let (io_read_bytes, io_write_bytes, io_rchar, io_wchar, io_cancelled_write_bytes) = 
+            read_process_io(&proc_path);
+
+        // Calculate I/O rates
+        let time_delta_secs = now_ms.saturating_sub(self.prev_time_ms) as f64 / 1000.0;
+        let io_read_bytes_per_sec = if time_delta_secs > 0.0 {
+            if let Some(prev) = self.prev_io_read_bytes {
+                io_read_bytes.saturating_sub(prev) as f64 / time_delta_secs
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let io_write_bytes_per_sec = if time_delta_secs > 0.0 {
+            if let Some(prev) = self.prev_io_write_bytes {
+                io_write_bytes.saturating_sub(prev) as f64 / time_delta_secs
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
         // Update state
         self.prev_utime = Some(utime);
         self.prev_stime = Some(stime);
+        self.prev_io_read_bytes = Some(io_read_bytes);
+        self.prev_io_write_bytes = Some(io_write_bytes);
         self.prev_time_ms = now_ms;
 
         Ok(ProcessMetrics {
@@ -164,14 +224,87 @@ impl ProcessCollector {
             state,
             rss_bytes,
             vsize_bytes,
+            vm_peak,
+            rss_anon,
+            rss_file,
+            rss_shmem,
+            vm_swap,
             cpu_percent,
             utime,
             stime,
             num_threads,
             num_fds,
             cmdline,
+            io_read_bytes,
+            io_write_bytes,
+            io_rchar,
+            io_wchar,
+            io_cancelled_write_bytes,
+            io_read_bytes_per_sec,
+            io_write_bytes_per_sec,
         })
     }
+}
+
+/// Read memory breakdown from /proc/[pid]/status
+fn read_process_status(proc_path: &str) -> (u64, u64, u64, u64, u64) {
+    let status = fs::read_to_string(format!("{}/status", proc_path)).unwrap_or_default();
+    
+    let mut vm_peak: u64 = 0;
+    let mut rss_anon: u64 = 0;
+    let mut rss_file: u64 = 0;
+    let mut rss_shmem: u64 = 0;
+    let mut vm_swap: u64 = 0;
+    
+    for line in status.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        // Values in /proc/[pid]/status are in kB
+        let value: u64 = parts[1].parse().unwrap_or(0) * 1024;
+        
+        match parts[0] {
+            "VmPeak:" => vm_peak = value,
+            "RssAnon:" => rss_anon = value,
+            "RssFile:" => rss_file = value,
+            "RssShmem:" => rss_shmem = value,
+            "VmSwap:" => vm_swap = value,
+            _ => {}
+        }
+    }
+    
+    (vm_peak, rss_anon, rss_file, rss_shmem, vm_swap)
+}
+
+/// Read I/O counters from /proc/[pid]/io
+fn read_process_io(proc_path: &str) -> (u64, u64, u64, u64, u64) {
+    let io = fs::read_to_string(format!("{}/io", proc_path)).unwrap_or_default();
+    
+    let mut read_bytes: u64 = 0;
+    let mut write_bytes: u64 = 0;
+    let mut rchar: u64 = 0;
+    let mut wchar: u64 = 0;
+    let mut cancelled_write_bytes: u64 = 0;
+    
+    for line in io.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let value: u64 = parts[1].parse().unwrap_or(0);
+        
+        match parts[0] {
+            "read_bytes:" => read_bytes = value,
+            "write_bytes:" => write_bytes = value,
+            "rchar:" => rchar = value,
+            "wchar:" => wchar = value,
+            "cancelled_write_bytes:" => cancelled_write_bytes = value,
+            _ => {}
+        }
+    }
+    
+    (read_bytes, write_bytes, rchar, wchar, cancelled_write_bytes)
 }
 
 /// Find a process by name or command-line pattern (returns best match)

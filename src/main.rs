@@ -104,6 +104,10 @@ struct Args {
     /// Output directory for generated plots (default: ./plots)
     #[arg(long, default_value = "plots")]
     plot_output: PathBuf,
+
+    /// Automatically split logs when monitored process starts or ends
+    #[arg(long)]
+    split_on_process: bool,
 }
 
 /// Application state
@@ -112,12 +116,14 @@ struct App {
     mem_collector: metrics::memory::MemoryCollector,
     disk_collector: metrics::disk::DiskCollector,
     net_collector: metrics::network::NetworkCollector,
+    psi_collector: metrics::psi::PsiCollector,
     proc_collector: Option<ProcessCollector>,
 
     cpu_metrics: Option<CpuMetrics>,
     mem_metrics: Option<MemoryMetrics>,
     disk_metrics: Option<DiskMetrics>,
     net_metrics: Option<NetworkMetrics>,
+    psi_metrics: Option<metrics::PsiMetrics>,
     proc_metrics: Option<ProcessMetrics>,
 
     alert_checker: AlertChecker,
@@ -144,6 +150,10 @@ struct App {
     pending_log_split: bool,  // Confirmation state for log split
     status_message: Option<(String, std::time::Instant)>,  // Temporary status message
     tui_mode: bool,  // Whether running in TUI mode (suppress eprintln)
+
+    // Auto-split on process state change
+    split_on_process: bool,
+    prev_process_running: bool,
 
     // History for sparkline graphs
     cpu_history: CpuHistory,
@@ -202,16 +212,21 @@ impl App {
             ..Default::default()
         };
 
+        // Determine initial process running state
+        let initial_process_running = proc_collector.is_some();
+
         Ok(Self {
             cpu_collector: metrics::cpu::CpuCollector::new(),
             mem_collector: metrics::memory::MemoryCollector::new(),
             disk_collector,
             net_collector: metrics::network::NetworkCollector::new(),
+            psi_collector: metrics::psi::PsiCollector::new(),
             proc_collector,
             cpu_metrics: None,
             mem_metrics: None,
             disk_metrics: None,
             net_metrics: None,
+            psi_metrics: None,
             proc_metrics: None,
             alert_checker: AlertChecker::new(thresholds),
             alerts: Vec::new(),
@@ -231,6 +246,8 @@ impl App {
             pending_log_split: false,
             status_message: None,
             tui_mode: false,  // Set by run_tui
+            split_on_process: args.split_on_process,
+            prev_process_running: initial_process_running,
             cpu_history: CpuHistory::default(),
             memory_history: MemoryHistory::default(),
             disk_history: DiskHistory::default(),
@@ -299,6 +316,7 @@ impl App {
         self.mem_metrics = Some(self.mem_collector.collect()?);
         self.disk_metrics = Some(self.disk_collector.collect()?);
         self.net_metrics = Some(self.net_collector.collect()?);
+        self.psi_metrics = self.psi_collector.collect().ok();
 
         // Update history for sparklines
         if let Some(ref cpu) = self.cpu_metrics {
@@ -324,6 +342,39 @@ impl App {
                 self.current_monitored_pid = None;
             }
         }
+
+        // Check for process state change and auto-split logs if enabled
+        let current_process_running = self.proc_collector.is_some() && self.proc_metrics.is_some();
+        if self.split_on_process && self.samples_collected > 0 {
+            if current_process_running != self.prev_process_running {
+                // Process state changed - split logs
+                let event = if current_process_running {
+                    "process started"
+                } else {
+                    "process ended"
+                };
+                
+                // Only split if logging is configured
+                if self.json_log_base.is_some() || self.text_log_base.is_some() {
+                    if let Err(e) = self.rotate_logs() {
+                        let msg = format!("Auto-split failed on {}: {}", event, e);
+                        if self.tui_mode {
+                            self.set_status(&msg);
+                        } else {
+                            eprintln!("{}", msg);
+                        }
+                    } else {
+                        let msg = format!("Logs split on {} → segment {}", event, self.log_segment);
+                        if self.tui_mode {
+                            self.set_status(&msg);
+                        } else {
+                            eprintln!("{}", msg);
+                        }
+                    }
+                }
+            }
+        }
+        self.prev_process_running = current_process_running;
 
         self.samples_collected += 1;
 
@@ -355,6 +406,7 @@ impl App {
                 disk: disk.clone(),
                 network: net.clone(),
                 process: self.proc_metrics.clone(),
+                psi: self.psi_metrics.clone(),
             };
 
             if self.logging_enabled {

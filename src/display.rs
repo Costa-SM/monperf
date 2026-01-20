@@ -386,34 +386,64 @@ pub fn render_memory(f: &mut Frame, area: Rect, mem: &MemoryMetrics, history: Op
     ];
     f.render_widget(Paragraph::new(details), text_chunks[2]);
 
-    // Memory history sparkline at bottom (fills remaining space)
-    // Memory history sparkline (sized to graph width)
+    // Memory history sparklines at bottom (fills remaining space)
+    // Show CGroup and RAM as separate graphs if CGroup is available
     if let Some(hist) = history {
         if !hist.used_percent.is_empty() {
-            // Determine if we should show cgroup or system memory
             let has_cgroup = hist.cgroup_percent.iter().any(|&v| v > 0);
-            let (raw_data, color) = if has_cgroup {
-                (&hist.cgroup_percent[..], Color::Red)
-            } else {
-                (&hist.used_percent[..], Color::Magenta)
-            };
-            let data = slice_for_width(raw_data, main_chunks[1]);
-            let max_val = data.iter().max().copied().unwrap_or(100);
-            let title = if has_cgroup {
-                format!(" Cgroup % (max {}%) ", max_val)
-            } else {
-                format!(" RAM % (max {}%) ", max_val)
-            };
             
-            let sparkline = Sparkline::default()
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .title(title))
-                .data(data)
-                .max(100)  // Memory is always 0-100%
-                .style(Style::default().fg(color));
-            f.render_widget(sparkline, main_chunks[1]);
+            if has_cgroup {
+                // Split into two graphs: CGroup (top) and RAM (bottom)
+                let graph_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Ratio(1, 2),  // CGroup sparkline
+                        Constraint::Ratio(1, 2),  // RAM sparkline
+                    ])
+                    .split(main_chunks[1]);
+                
+                // CGroup sparkline (red)
+                let cgroup_data = slice_for_width(&hist.cgroup_percent, graph_chunks[0]);
+                let cgroup_max = cgroup_data.iter().max().copied().unwrap_or(100);
+                let cgroup_title = format!(" CGroup % (max {}%) ", cgroup_max);
+                let cgroup_sparkline = Sparkline::default()
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(cgroup_title))
+                    .data(cgroup_data)
+                    .max(100)
+                    .style(Style::default().fg(Color::Red));
+                f.render_widget(cgroup_sparkline, graph_chunks[0]);
+                
+                // RAM sparkline (magenta)
+                let ram_data = slice_for_width(&hist.used_percent, graph_chunks[1]);
+                let ram_max = ram_data.iter().max().copied().unwrap_or(100);
+                let ram_title = format!(" RAM % (max {}%) ", ram_max);
+                let ram_sparkline = Sparkline::default()
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(ram_title))
+                    .data(ram_data)
+                    .max(100)
+                    .style(Style::default().fg(Color::Magenta));
+                f.render_widget(ram_sparkline, graph_chunks[1]);
+            } else {
+                // No CGroup - just show RAM in full area
+                let ram_data = slice_for_width(&hist.used_percent, main_chunks[1]);
+                let ram_max = ram_data.iter().max().copied().unwrap_or(100);
+                let title = format!(" RAM % (max {}%) ", ram_max);
+                let sparkline = Sparkline::default()
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(title))
+                    .data(ram_data)
+                    .max(100)
+                    .style(Style::default().fg(Color::Magenta));
+                f.render_widget(sparkline, main_chunks[1]);
+            }
         }
     }
 }

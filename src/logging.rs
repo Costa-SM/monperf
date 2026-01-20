@@ -1,7 +1,7 @@
 //! Historical logging module for writing metrics to files.
 
 use crate::display::{format_bytes, format_bytes_short, format_throughput, truncate_str};
-use crate::metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics};
+use crate::metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics, PsiMetrics};
 use crate::process::ProcessMetrics;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -20,6 +20,8 @@ pub struct MetricsSample {
     pub network: NetworkMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psi: Option<PsiMetrics>,
 }
 
 /// Logger for writing metrics to JSON Lines file
@@ -97,33 +99,42 @@ impl TextLogger {
             samples_written: 0,
         };
 
-        // Write header
+        // Write header - aligned with the extended output format
         writeln!(logger.writer, "# Performance Monitor Log")?;
         writeln!(logger.writer, "# Started: {}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"))?;
         writeln!(logger.writer, "#")?;
-        writeln!(logger.writer, "# Columns:")?;
+        writeln!(logger.writer, "# Column Definitions:")?;
+        writeln!(logger.writer, "#")?;
+        writeln!(logger.writer, "# CPU Section:")?;
         writeln!(logger.writer, "#   Time     - Sample timestamp (HH:MM:SS)")?;
         writeln!(logger.writer, "#   CPU%     - Total CPU utilization")?;
-        writeln!(logger.writer, "#   Usr%     - User-space CPU time")?;
-        writeln!(logger.writer, "#   Sys%     - Kernel-space CPU time")?;
         writeln!(logger.writer, "#   IOW%     - CPU time waiting for I/O")?;
-        writeln!(logger.writer, "#   Load     - 1-minute load average")?;
+        writeln!(logger.writer, "#")?;
+        writeln!(logger.writer, "# Memory Section:")?;
         writeln!(logger.writer, "#   Mem%     - System memory used")?;
         writeln!(logger.writer, "#   CG%      - Cgroup memory used (container limit)")?;
-        writeln!(logger.writer, "#   MemAvl   - Available memory")?;
-        writeln!(logger.writer, "#   DiskR    - Disk read throughput")?;
-        writeln!(logger.writer, "#   DiskW    - Disk write throughput")?;
-        writeln!(logger.writer, "#   DiskU%   - Max disk utilization")?;
-        writeln!(logger.writer, "#   NetRX    - Network receive throughput")?;
-        writeln!(logger.writer, "#   NetTX    - Network transmit throughput")?;
-        writeln!(logger.writer, "#   Proc     - Monitored process (name:cpu%/rss/threads/fds)")?;
+        writeln!(logger.writer, "#   Cache    - File-backed page cache (mmap'd parquet files live here)")?;
+        writeln!(logger.writer, "#   Dirty    - Pages modified but not yet written to disk")?;
+        writeln!(logger.writer, "#")?;
+        writeln!(logger.writer, "# Process Section (if monitored with -p or -n):")?;
+        writeln!(logger.writer, "#   RssAnon  - Anonymous memory (heap, stack, allocations)")?;
+        writeln!(logger.writer, "#   RssFile  - File-backed memory (mmap'd files in process space)")?;
+        writeln!(logger.writer, "#   ProcRd   - Actual bytes read from disk by process")?;
+        writeln!(logger.writer, "#   ProcWr   - Actual bytes written to disk by process")?;
+        writeln!(logger.writer, "#")?;
+        writeln!(logger.writer, "# Disk Section:")?;
+        writeln!(logger.writer, "#   InFlt    - I/O requests currently in flight")?;
+        writeln!(logger.writer, "#")?;
+        writeln!(logger.writer, "# PSI (Pressure Stall Information):")?;
+        writeln!(logger.writer, "#   MemPSI   - % time tasks stalled on memory (some avg10)")?;
+        writeln!(logger.writer, "#   IoPSI    - % time tasks stalled on I/O (some avg10)")?;
         writeln!(logger.writer, "#")?;
         writeln!(logger.writer, 
-            "{:<8} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>9} {:>10} {:>10} {:>5} {:>10} {:>10} {}",
-            "Time", "CPU%", "Usr%", "Sys%", "IOW%", "Load", "Mem%", "CG%", "MemAvl", 
-            "DiskR", "DiskW", "DskU%", "NetRX", "NetTX", "Process"
+            "{:<8} {:>5} {:>5} {:>5} {:>5} {:>7} {:>7} {:>8} {:>8} {:>10} {:>10} {:>5} {:>5} {:>5}",
+            "Time", "CPU%", "IOW%", "Mem%", "CG%", "Cache", "Dirty", "RssAnon", "RssFile",
+            "ProcRd", "ProcWr", "InFlt", "MemPS", "IoPSI"
         )?;
-        writeln!(logger.writer, "{}", "-".repeat(140))?;
+        writeln!(logger.writer, "{}", "-".repeat(115))?;
 
         Ok(logger)
     }
@@ -137,41 +148,50 @@ impl TextLogger {
             .map(|p| format!("{:>5.1}", p))
             .unwrap_or_else(|| "  N/A".to_string());
 
-        // Max disk utilization across all disks
-        let max_disk_util = sample.disk.disks.iter()
-            .map(|d| d.utilization_percent)
-            .fold(0.0_f64, |a, b| a.max(b));
+        // Page cache info
+        let cache_str = format_bytes_short(sample.memory.cached);
+        let dirty_str = format_bytes_short(sample.memory.dirty);
 
-        // Process info - more detailed
-        let proc_str = sample.process.as_ref()
-            .map(|p| format!(
-                "{}:{:.0}%/{}/{}/{}",
-                truncate_str(&p.name, 12),
-                p.cpu_percent,
-                format_bytes_short(p.rss_bytes),
-                p.num_threads,
-                p.num_fds
+        // Process memory breakdown and I/O
+        let (rss_anon_str, rss_file_str, proc_rd_str, proc_wr_str) = sample.process.as_ref()
+            .map(|p| (
+                format_bytes_short(p.rss_anon),
+                format_bytes_short(p.rss_file),
+                format_throughput(p.io_read_bytes_per_sec),
+                format_throughput(p.io_write_bytes_per_sec),
             ))
-            .unwrap_or_else(|| "-".to_string());
+            .unwrap_or_else(|| (
+                "     N/A".to_string(),
+                "     N/A".to_string(),
+                "       N/A".to_string(),
+                "       N/A".to_string(),
+            ));
+
+        // Total in-flight I/O
+        let in_flight = sample.disk.total_in_flight;
+
+        // PSI metrics
+        let (mem_psi, io_psi) = sample.psi.as_ref()
+            .map(|p| (p.memory.some_avg10, p.io.some_avg10))
+            .unwrap_or((0.0, 0.0));
 
         writeln!(
             self.writer,
-            "{:<8} {:>5.1} {:>5.1} {:>5.1} {:>5.1} {:>5.2} {:>5.1} {} {:>9} {:>10} {:>10} {:>5.1} {:>10} {:>10} {}",
+            "{:<8} {:>5.1} {:>5.1} {:>5.1} {} {:>7} {:>7} {:>8} {:>8} {:>10} {:>10} {:>5} {:>5.1} {:>5.1}",
             timestamp,
             sample.cpu.total_utilization,
-            sample.cpu.user_percent,
-            sample.cpu.system_percent,
             sample.cpu.iowait_percent,
-            sample.cpu.load_avg.0,
             sample.memory.used_percent,
             cgroup_str,
-            format_bytes_short(sample.memory.available),
-            format_throughput(sample.disk.total_read_bytes_per_sec),
-            format_throughput(sample.disk.total_write_bytes_per_sec),
-            max_disk_util,
-            format_throughput(sample.network.total_rx_bytes_per_sec),
-            format_throughput(sample.network.total_tx_bytes_per_sec),
-            proc_str,
+            cache_str,
+            dirty_str,
+            rss_anon_str,
+            rss_file_str,
+            proc_rd_str,
+            proc_wr_str,
+            in_flight,
+            mem_psi,
+            io_psi,
         )?;
 
         self.samples_written += 1;

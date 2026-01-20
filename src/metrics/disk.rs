@@ -27,6 +27,8 @@ pub struct DiskStats {
     pub utilization_percent: f64,
     /// Queue depth (average)
     pub queue_depth: f64,
+    /// I/O requests currently in flight (snapshot)
+    pub in_flight: u64,
     /// Total reads completed
     pub reads_completed: u64,
     /// Total writes completed
@@ -62,6 +64,8 @@ pub struct DiskMetrics {
     pub total_read_bytes_per_sec: f64,
     /// Total write throughput across all disks (bytes/sec)
     pub total_write_bytes_per_sec: f64,
+    /// Total I/O requests in flight across all disks
+    pub total_in_flight: u64,
     /// Spill directory information (if configured)
     pub spill_dir_info: Option<SpillDirInfo>,
 }
@@ -204,6 +208,7 @@ impl DiskCollector {
                         write_latency_ms,
                         utilization_percent,
                         queue_depth,
+                        in_flight: stats.ios_in_progress,
                         reads_completed: stats.reads_completed,
                         writes_completed: stats.writes_completed,
                         bytes_read: stats.sectors_read * self.sector_size,
@@ -216,6 +221,7 @@ impl DiskCollector {
         // Calculate totals
         let total_read = disks.iter().map(|d| d.read_bytes_per_sec).sum();
         let total_write = disks.iter().map(|d| d.write_bytes_per_sec).sum();
+        let total_in_flight = disks.iter().map(|d| d.in_flight).sum();
 
         // Get spill directory info
         let spill_dir_info = self.spill_dir.as_ref().and_then(|path| get_dir_info(path));
@@ -228,6 +234,7 @@ impl DiskCollector {
             disks,
             total_read_bytes_per_sec: total_read,
             total_write_bytes_per_sec: total_write,
+            total_in_flight,
             spill_dir_info,
         })
     }
