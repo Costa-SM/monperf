@@ -21,8 +21,8 @@ All major sections include real-time sparkline graphs showing historical trends:
 - Network RX/TX throughput
 
 ### Logging
-- **JSON Lines** (`.jsonl`): Machine-readable format with all metrics for post-analysis
-- **Human-readable text** (`.txt`): Columnar format for quick review
+- **CSV** (`.csv`): Canonical format with all detailed metrics (per-core CPU, per-disk I/O, per-interface network)
+- **Human-readable text** (`.txt`): Columnar summary format for quick review
 
 ### Advanced Metrics
 - **PSI (Pressure Stall Information)**: CPU, memory, and I/O pressure metrics
@@ -59,7 +59,7 @@ cargo build --release
 ./monperf
 
 # Monitor with logging
-./monperf -l metrics.json -o observations.txt
+./monperf -l metrics.csv -o observations.txt
 ```
 
 ### Monitor a Specific Process
@@ -75,13 +75,13 @@ cargo build --release
 ### Headless Mode (No TUI)
 ```bash
 # Run for 60 seconds, collect 60 samples
-./monperf --no-tui -d 60 -l metrics.json -o observations.txt
+./monperf --no-tui -d 60 -l metrics.csv -o observations.txt
 ```
 
 ### Generate Plots from Logs
 ```bash
-# Generate SVG plots from a JSON log file
-./monperf plot metrics.json --output-dir ./plots
+# Generate SVG plots from a CSV log file
+./monperf plot metrics.csv --output-dir ./plots
 ```
 
 ## Command Line Options
@@ -90,10 +90,9 @@ cargo build --release
 |--------|-------------|
 | `-p, --pid <PID>` | Monitor a specific process by PID |
 | `-n, --name <PATTERN>` | Monitor process matching name/cmdline pattern |
-| `-l, --log <FILE>` | Write JSON metrics to file |
-| `-o, --observations <FILE>` | Write human-readable log to file (compact) |
-| `--detailed-log <FILE>` | Write detailed CSV with all metrics (per-core, per-disk, per-interface) |
-| `-i, --interval <MS>` | Sampling interval in milliseconds (default: 1000) |
+| `-l, --log <FILE>` | Write detailed CSV metrics to file (canonical format) |
+| `-o, --text-log <FILE>` | Write human-readable summary log to file |
+| `-i, --interval <SECS>` | Sampling interval in seconds (default: 1) |
 | `-d, --duration <SECS>` | Run for N seconds then exit |
 | `--no-tui` | Disable TUI, print to stdout |
 | `--split-on-process` | Auto-split logs when monitored process starts/ends |
@@ -111,21 +110,22 @@ cargo build --release
 
 ## Log Output Format
 
-### JSON (metrics.json)
-Each line is a complete JSON object with all metrics:
-```json
-{
-  "timestamp": "2026-01-20T12:00:00Z",
-  "cpu": { "total_utilization": 45.2, "user_percent": 30.1, ... },
-  "memory": { "used": 8589934592, "total": 17179869184, ... },
-  "disk": { "total_read_bytes_per_sec": 1048576, ... },
-  "network": { "total_rx_bytes_per_sec": 102400, ... },
-  "process": { "pid": 12345, "rss_bytes": 104857600, ... },
-  "psi": { "cpu": { "some_avg10": 0.5 }, "memory": { ... }, "io": { ... } }
-}
+### CSV (metrics.csv) - Canonical Format
+The CSV format is the canonical log format containing all detailed metrics:
+```csv
+timestamp,cpu_total_pct,cpu_user_pct,cpu_system_pct,cpu_iowait_pct,cpu_load_1m,...,cpu_core0_pct,cpu_core1_pct,...,mem_total_bytes,mem_used_bytes,...,disk_total_read_bytes_per_sec,...,disk_nvme0n1_read_bytes_per_sec,...,net_total_rx_bytes_per_sec,...,net_eth0_rx_bytes_per_sec,...,psi_cpu_some_avg10,...,proc_pid,proc_name,...
+2026-01-20 12:00:00.123,45.20,30.10,15.10,2.10,1.50,...,42.50,48.30,...,17179869184,8589934592,...,1048576.00,...,524288.00,...,102400.00,...,51200.00,...,0.50,...,12345,"python",...
 ```
 
-### Text (observations.txt)
+**Column groups:**
+- **CPU**: Total, user, system, iowait, load average, context switches, interrupts, per-core utilization
+- **Memory**: Total, used, available, buffers, cached, dirty, writeback, swap, cgroup
+- **Disk**: Total read/write throughput, per-disk read/write, IOPS, latency, utilization, in-flight
+- **Network**: Total RX/TX, per-interface RX/TX, packets/sec, errors, link speed, utilization
+- **PSI**: CPU, memory, I/O pressure (some/full averages at 10s, 60s, 300s)
+- **Process**: PID, name, state, CPU%, threads, FDs, memory breakdown, I/O rates
+
+### Text (observations.txt) - Human-Readable Summary
 ```
 Time      CPU%  IOW%  Mem%   CG%   Cache   Dirty  RssAnon  RssFile  ...
 12:00:00  45.2   2.1  50.0  48.5   4.2G    12M      2.1G    512M   ...
@@ -156,7 +156,7 @@ cargo test
 src/
 ├── main.rs          # Entry point, TUI loop, CLI parsing
 ├── display.rs       # TUI rendering (ratatui widgets)
-├── logging.rs       # JSON and text log writers
+├── logging.rs       # CSV and text log writers
 ├── alert.rs         # Alert thresholds and checking
 ├── process.rs       # Process discovery and metrics
 ├── plot.rs          # SVG plot generation

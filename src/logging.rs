@@ -1,81 +1,27 @@
 //! Historical logging module for writing metrics to files.
+//!
+//! The canonical log format is CSV (CsvLogger), containing all detailed metrics.
+//! The human-readable text format (TextLogger) derives simpler metrics from the same data.
 
 use crate::display::{format_bytes_short, format_throughput};
 use crate::metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics, PsiMetrics};
 use crate::process::ProcessMetrics;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// A single metrics sample with timestamp
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MetricsSample {
     pub timestamp: DateTime<Utc>,
     pub cpu: CpuMetrics,
     pub memory: MemoryMetrics,
     pub disk: DiskMetrics,
     pub network: NetworkMetrics,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessMetrics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub psi: Option<PsiMetrics>,
-}
-
-/// Logger for writing metrics to JSON Lines file
-pub struct MetricsLogger {
-    writer: BufWriter<File>,
-    samples_written: u64,
-}
-
-impl MetricsLogger {
-    /// Create a new logger writing to the specified file
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path.as_ref())
-            .context("Failed to create log file")?;
-
-        Ok(Self {
-            writer: BufWriter::new(file),
-            samples_written: 0,
-        })
-    }
-
-    /// Append a sample to the log file
-    pub fn log(&mut self, sample: &MetricsSample) -> Result<()> {
-        let json = serde_json::to_string(sample)?;
-        writeln!(self.writer, "{}", json)?;
-        self.samples_written += 1;
-
-        // Flush every 10 samples to avoid losing data on crash
-        if self.samples_written % 10 == 0 {
-            self.writer.flush()?;
-        }
-
-        Ok(())
-    }
-
-    /// Flush any buffered data
-    pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    /// Get the number of samples written
-    pub fn samples_written(&self) -> u64 {
-        self.samples_written
-    }
-}
-
-impl Drop for MetricsLogger {
-    fn drop(&mut self) {
-        let _ = self.writer.flush();
-    }
 }
 
 /// Logger for writing human-readable text observations to a file
@@ -215,9 +161,10 @@ impl Drop for TextLogger {
     }
 }
 
-/// Detailed CSV logger for writing comprehensive metrics to a CSV file
-/// Includes per-core CPU, per-disk I/O, per-interface network, and full PSI breakdown
-pub struct DetailedTextLogger {
+/// Canonical CSV logger for writing comprehensive metrics to a CSV file.
+/// This is the primary log format, containing all detailed metrics:
+/// per-core CPU, per-disk I/O, per-interface network, and full PSI breakdown.
+pub struct CsvLogger {
     writer: BufWriter<File>,
     samples_written: u64,
     header_written: bool,
@@ -227,15 +174,15 @@ pub struct DetailedTextLogger {
     interface_names: Vec<String>,
 }
 
-impl DetailedTextLogger {
-    /// Create a new detailed CSV logger writing to the specified file
+impl CsvLogger {
+    /// Create a new CSV logger writing to the specified file
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path.as_ref())
-            .context("Failed to create detailed CSV file")?;
+            .context("Failed to create CSV log file")?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -567,14 +514,14 @@ impl DetailedTextLogger {
     }
 }
 
-impl Drop for DetailedTextLogger {
+impl Drop for CsvLogger {
     fn drop(&mut self) {
         let _ = self.writer.flush();
     }
 }
 
 /// Summary statistics calculated from metrics history
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct MetricsSummary {
     pub duration_secs: f64,
     pub samples_count: u64,

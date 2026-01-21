@@ -20,7 +20,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use display::{format_bytes, format_throughput, CpuHistory, DiskHistory, MemoryHistory, NetworkHistory};
-use logging::{DetailedTextLogger, MetricsLogger, MetricsSample, SummaryAccumulator, TextLogger};
+use logging::{CsvLogger, MetricsSample, SummaryAccumulator, TextLogger};
 use metrics::{CpuMetrics, DiskMetrics, MemoryMetrics, NetworkMetrics};
 use process::{ProcessCollector, ProcessMetrics};
 use ratatui::{
@@ -29,6 +29,7 @@ use ratatui::{
     Terminal,
 };
 use std::io;
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,20 +47,16 @@ struct Args {
     process_name: Option<String>,
 
     /// Sampling interval in seconds
-    #[arg(short, long, default_value = "1")]
+    #[arg(short = 'i', long, default_value = "1")]
     interval: f64,
 
-    /// Log metrics to file (JSON Lines format)
+    /// Log all metrics to CSV file (canonical detailed format)
     #[arg(short, long)]
-    log_file: Option<PathBuf>,
+    log: Option<PathBuf>,
 
-    /// Log metrics to file (human-readable text format)
+    /// Log metrics to file (human-readable summary format)
     #[arg(short = 'o', long)]
     text_log: Option<PathBuf>,
-
-    /// Log metrics to file (detailed human-readable format with all metrics)
-    #[arg(long)]
-    detailed_log: Option<PathBuf>,
 
     /// Spill directory to monitor for size
     #[arg(short, long)]
@@ -101,7 +98,7 @@ struct Args {
     #[arg(long, default_value = "95")]
     cgroup_crit: f64,
 
-    /// Generate plots from a JSON log file (use with --plot-output)
+    /// Generate plots from a CSV log file (use with --plot-output)
     #[arg(long)]
     plot: Option<PathBuf>,
 
@@ -112,6 +109,10 @@ struct Args {
     /// Automatically split logs when monitored process starts or ends
     #[arg(long)]
     split_on_process: bool,
+
+    /// UDP port to listen for control messages (split logs on message, rename if filename provided)
+    #[arg(long)]
+    control_port: Option<u16>,
 }
 
 /// Application state
@@ -133,9 +134,8 @@ struct App {
     alert_checker: AlertChecker,
     alerts: Vec<alert::Alert>,
 
-    logger: Option<MetricsLogger>,
+    csv_logger: Option<CsvLogger>,
     text_logger: Option<TextLogger>,
-    detailed_logger: Option<DetailedTextLogger>,
     accumulator: SummaryAccumulator,
 
     uptime_secs: u64,
@@ -149,9 +149,8 @@ struct App {
     current_monitored_pid: Option<u32>,
 
     // Log rotation settings
-    json_log_base: Option<PathBuf>,
+    csv_log_base: Option<PathBuf>,
     text_log_base: Option<PathBuf>,
-    detailed_log_base: Option<PathBuf>,
     log_segment: u32,
     pending_log_split: bool,  // Confirmation state for log split
     status_message: Option<(String, std::time::Instant)>,  // Temporary status message
@@ -166,6 +165,9 @@ struct App {
     memory_history: MemoryHistory,
     disk_history: DiskHistory,
     network_history: NetworkHistory,
+
+    // Control socket for external log split commands
+    control_socket: Option<UdpSocket>,
 }
 
 impl App {
@@ -193,23 +195,16 @@ impl App {
             disk_collector.set_spill_dir(&spill_dir.to_string_lossy());
         }
 
-        // Setup JSON logger
-        let logger = if let Some(ref log_path) = args.log_file {
-            Some(MetricsLogger::new(log_path)?)
+        // Setup CSV logger (canonical detailed format)
+        let csv_logger = if let Some(ref log_path) = args.log {
+            Some(CsvLogger::new(log_path)?)
         } else {
             None
         };
 
-        // Setup text logger
+        // Setup text logger (human-readable summary)
         let text_logger = if let Some(ref log_path) = args.text_log {
             Some(TextLogger::new(log_path)?)
-        } else {
-            None
-        };
-
-        // Setup detailed logger
-        let detailed_logger = if let Some(ref log_path) = args.detailed_log {
-            Some(DetailedTextLogger::new(log_path)?)
         } else {
             None
         };
@@ -228,6 +223,24 @@ impl App {
         // Determine initial process running state
         let initial_process_running = proc_collector.is_some();
 
+        // Setup control socket if port specified
+        let control_socket = if let Some(port) = args.control_port {
+            match UdpSocket::bind(format!("127.0.0.1:{}", port)) {
+                Ok(socket) => {
+                    // Set non-blocking so we don't block the main loop
+                    socket.set_nonblocking(true)?;
+                    eprintln!("Control socket listening on UDP port {}", port);
+                    Some(socket)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to bind control socket on port {}: {}", port, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             cpu_collector: metrics::cpu::CpuCollector::new(),
             mem_collector: metrics::memory::MemoryCollector::new(),
@@ -243,9 +256,8 @@ impl App {
             proc_metrics: None,
             alert_checker: AlertChecker::new(thresholds),
             alerts: Vec::new(),
-            logger,
+            csv_logger,
             text_logger,
-            detailed_logger,
             accumulator: SummaryAccumulator::new(),
             uptime_secs: 0,
             samples_collected: 0,
@@ -254,9 +266,8 @@ impl App {
             process_name_pattern: pattern,
             process_rescan_interval: 10, // Rescan for process every 10 samples
             current_monitored_pid: current_pid,
-            json_log_base: args.log_file.clone(),
+            csv_log_base: args.log.clone(),
             text_log_base: args.text_log.clone(),
-            detailed_log_base: args.detailed_log.clone(),
             log_segment: 0,
             pending_log_split: false,
             status_message: None,
@@ -267,6 +278,7 @@ impl App {
             memory_history: MemoryHistory::default(),
             disk_history: DiskHistory::default(),
             network_history: NetworkHistory::default(),
+            control_socket,
         })
     }
 
@@ -370,7 +382,7 @@ impl App {
                 };
                 
                 // Only split if logging is configured
-                if self.json_log_base.is_some() || self.text_log_base.is_some() || self.detailed_log_base.is_some() {
+                if self.csv_log_base.is_some() || self.text_log_base.is_some() {
                     if let Err(e) = self.rotate_logs() {
                         let msg = format!("Auto-split failed on {}: {}", event, e);
                         if self.tui_mode {
@@ -425,12 +437,12 @@ impl App {
             };
 
             if self.logging_enabled {
-                if let Some(ref mut logger) = self.logger {
-                    if let Err(e) = logger.log(&sample) {
+                if let Some(ref mut csv_logger) = self.csv_logger {
+                    if let Err(e) = csv_logger.log(&sample) {
                         if self.tui_mode {
-                            self.set_status(&format!("JSON log error: {}", e));
+                            self.set_status(&format!("CSV log error: {}", e));
                         } else {
-                            eprintln!("JSON log error: {}", e);
+                            eprintln!("CSV log error: {}", e);
                         }
                     }
                 }
@@ -440,15 +452,6 @@ impl App {
                             self.set_status(&format!("Text log error: {}", e));
                         } else {
                             eprintln!("Text log error: {}", e);
-                        }
-                    }
-                }
-                if let Some(ref mut detailed_logger) = self.detailed_logger {
-                    if let Err(e) = detailed_logger.log(&sample) {
-                        if self.tui_mode {
-                            self.set_status(&format!("Detailed log error: {}", e));
-                        } else {
-                            eprintln!("Detailed log error: {}", e);
                         }
                     }
                 }
@@ -465,31 +468,21 @@ impl App {
         self.log_segment += 1;
         let segment = self.log_segment;
         
-        // Rotate JSON log
-        if let Some(ref base_path) = self.json_log_base {
+        // Rotate CSV log (canonical format)
+        if let Some(ref base_path) = self.csv_log_base {
             let new_path = Self::segment_path(base_path, segment);
-            self.logger = Some(MetricsLogger::new(&new_path)?);
-            // Only print to stderr in non-TUI mode
+            self.csv_logger = Some(CsvLogger::new(&new_path)?);
             if !self.tui_mode {
-                eprintln!("Started new JSON log: {}", new_path.display());
+                eprintln!("Started new CSV log: {}", new_path.display());
             }
         }
         
-        // Rotate text log
+        // Rotate text log (human-readable summary)
         if let Some(ref base_path) = self.text_log_base {
             let new_path = Self::segment_path(base_path, segment);
             self.text_logger = Some(TextLogger::new(&new_path)?);
             if !self.tui_mode {
                 eprintln!("Started new text log: {}", new_path.display());
-            }
-        }
-        
-        // Rotate detailed log
-        if let Some(ref base_path) = self.detailed_log_base {
-            let new_path = Self::segment_path(base_path, segment);
-            self.detailed_logger = Some(DetailedTextLogger::new(&new_path)?);
-            if !self.tui_mode {
-                eprintln!("Started new detailed log: {}", new_path.display());
             }
         }
         
@@ -535,10 +528,9 @@ impl App {
 
     /// Get current log file name for display
     fn current_log_name(&self) -> Option<String> {
-        // Prefer detailed log name, then text log, then JSON log
-        let base = self.detailed_log_base.as_ref()
-            .or(self.text_log_base.as_ref())
-            .or(self.json_log_base.as_ref())?;
+        // Prefer CSV log name (canonical), then text log
+        let base = self.csv_log_base.as_ref()
+            .or(self.text_log_base.as_ref())?;
         
         let path = if self.log_segment == 0 {
             base.clone()
@@ -549,6 +541,98 @@ impl App {
         path.file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
+    }
+
+    /// Check for control messages on the UDP socket
+    /// Returns Some(filename) if a split was requested with a rename, None otherwise
+    fn check_control_messages(&mut self) -> Option<String> {
+        let socket = self.control_socket.as_ref()?;
+        
+        let mut buf = [0u8; 1024];
+        match socket.recv_from(&mut buf) {
+            Ok((len, addr)) => {
+                let msg = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+                
+                if !self.tui_mode {
+                    eprintln!("Control message from {}: '{}'", addr, msg);
+                }
+                
+                // Message can be:
+                // - Empty or "split" -> split logs, no rename
+                // - Filename -> split logs and rename current segment to this name
+                if msg.is_empty() || msg.eq_ignore_ascii_case("split") {
+                    Some(String::new())  // Empty string signals split without rename
+                } else {
+                    Some(msg)  // Filename to rename to
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No message available (non-blocking)
+                None
+            }
+            Err(e) => {
+                if !self.tui_mode {
+                    eprintln!("Control socket error: {}", e);
+                }
+                None
+            }
+        }
+    }
+
+    /// Rename the current log segment to a custom name
+    fn rename_current_segment(&mut self, new_name: &str) -> Result<()> {
+        // Get current paths
+        let csv_current = self.csv_log_base.as_ref().map(|base| {
+            if self.log_segment == 0 {
+                base.clone()
+            } else {
+                Self::segment_path(base, self.log_segment)
+            }
+        });
+        
+        let text_current = self.text_log_base.as_ref().map(|base| {
+            if self.log_segment == 0 {
+                base.clone()
+            } else {
+                Self::segment_path(base, self.log_segment)
+            }
+        });
+        
+        // Close current loggers first
+        self.csv_logger = None;
+        self.text_logger = None;
+        
+        // Rename CSV log
+        if let Some(current) = csv_current {
+            if current.exists() {
+                let dir = current.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let new_path = dir.join(format!("{}.csv", new_name));
+                if let Err(e) = std::fs::rename(&current, &new_path) {
+                    if !self.tui_mode {
+                        eprintln!("Failed to rename CSV log to {}: {}", new_path.display(), e);
+                    }
+                } else if !self.tui_mode {
+                    eprintln!("Renamed CSV log to: {}", new_path.display());
+                }
+            }
+        }
+        
+        // Rename text log
+        if let Some(current) = text_current {
+            if current.exists() {
+                let dir = current.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let new_path = dir.join(format!("{}.txt", new_name));
+                if let Err(e) = std::fs::rename(&current, &new_path) {
+                    if !self.tui_mode {
+                        eprintln!("Failed to rename text log to {}: {}", new_path.display(), e);
+                    }
+                } else if !self.tui_mode {
+                    eprintln!("Renamed text log to: {}", new_path.display());
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     fn print_metrics(&self) {
@@ -813,7 +897,7 @@ fn run_tui(mut app: App, interval: Duration, duration: Option<Duration>) -> Resu
                             }
                             KeyCode::Char('s') => {
                                 // Check if logging is configured
-                                if app.json_log_base.is_some() || app.text_log_base.is_some() || app.detailed_log_base.is_some() {
+                                if app.csv_log_base.is_some() || app.text_log_base.is_some() {
                                     app.pending_log_split = true;
                                 } else {
                                     app.set_status("No log files configured (-l, -o, or --detailed-log)");
@@ -822,6 +906,22 @@ fn run_tui(mut app: App, interval: Duration, duration: Option<Duration>) -> Resu
                             _ => {}
                         }
                     }
+                }
+            }
+        }
+
+        // Check for control messages (log split requests)
+        if let Some(rename_to) = app.check_control_messages() {
+            // First rename the current segment if a name was provided
+            if !rename_to.is_empty() {
+                let _ = app.rename_current_segment(&rename_to);
+            }
+            // Then rotate to a new segment
+            if app.csv_log_base.is_some() || app.text_log_base.is_some() {
+                if let Err(e) = app.rotate_logs() {
+                    app.set_status(&format!("Control split failed: {}", e));
+                } else {
+                    app.set_status("Log split via control port");
                 }
             }
         }
@@ -860,6 +960,22 @@ fn run_no_tui(mut app: App, interval: Duration, duration: Option<Duration>) -> R
         app.collect_metrics()?;
         app.print_metrics();
 
+        // Check for control messages (log split requests)
+        if let Some(rename_to) = app.check_control_messages() {
+            // First rename the current segment if a name was provided
+            if !rename_to.is_empty() {
+                let _ = app.rename_current_segment(&rename_to);
+            }
+            // Then rotate to a new segment
+            if app.csv_log_base.is_some() || app.text_log_base.is_some() {
+                if let Err(e) = app.rotate_logs() {
+                    eprintln!("Control split failed: {}", e);
+                } else {
+                    eprintln!("Log split via control port");
+                }
+            }
+        }
+
         std::thread::sleep(interval);
     }
 
@@ -873,11 +989,8 @@ async fn main() -> Result<()> {
     // Plot mode: generate plots from existing log file
     if let Some(ref log_path) = args.plot {
         eprintln!("Loading samples from: {}", log_path.display());
-        let samples = plot::load_samples(log_path)?;
-        eprintln!("Loaded {} samples", samples.len());
-        
         eprintln!("Generating plots in: {}", args.plot_output.display());
-        let generated = plot::generate_plots(&samples, &args.plot_output)?;
+        let generated = plot::generate_all_plots(log_path, &args.plot_output)?;
         
         eprintln!("\nGenerated {} plots:", generated.len());
         for path in generated {
@@ -913,14 +1026,11 @@ async fn main() -> Result<()> {
     }
 
     // Log file messages
-    if let Some(ref log_path) = args.log_file {
-        eprintln!("JSON metrics logged to: {}", log_path.display());
+    if let Some(ref log_path) = args.log {
+        eprintln!("CSV metrics logged to: {}", log_path.display());
     }
     if let Some(ref log_path) = args.text_log {
-        eprintln!("Text observations logged to: {}", log_path.display());
-    }
-    if let Some(ref log_path) = args.detailed_log {
-        eprintln!("Detailed metrics logged to: {}", log_path.display());
+        eprintln!("Text summary logged to: {}", log_path.display());
     }
 
     Ok(())
