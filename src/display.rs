@@ -1024,7 +1024,7 @@ pub fn render_help_bar(f: &mut Frame, area: Rect, pending_split: bool, status: O
     } else if let Some(msg) = status {
         (
             format!(" {} ", msg),
-            Style::default().fg(Color::White).bg(Color::Blue),
+            Style::default().fg(Color::Black).bg(Color::Green),
         )
     } else {
         let log_info = current_log
