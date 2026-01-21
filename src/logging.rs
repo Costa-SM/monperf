@@ -331,6 +331,9 @@ impl DetailedTextLogger {
             headers.push(format!("net_{}_tx_packets_per_sec", iface));
             headers.push(format!("net_{}_rx_errors", iface));
             headers.push(format!("net_{}_tx_errors", iface));
+            headers.push(format!("net_{}_link_speed_mbps", iface));
+            headers.push(format!("net_{}_rx_util_pct", iface));
+            headers.push(format!("net_{}_tx_util_pct", iface));
         }
 
         // PSI columns
@@ -478,9 +481,12 @@ impl DetailedTextLogger {
                 values.push(format!("{:.2}", iface.tx_packets_per_sec));
                 values.push(iface.rx_errors.to_string());
                 values.push(iface.tx_errors.to_string());
+                values.push(iface.link_speed_mbps.map(|v| v.to_string()).unwrap_or_default());
+                values.push(iface.rx_util_pct.map(|v| format!("{:.4}", v)).unwrap_or_default());
+                values.push(iface.tx_util_pct.map(|v| format!("{:.4}", v)).unwrap_or_default());
             } else {
                 // Interface not found in this sample, add empty values
-                for _ in 0..6 {
+                for _ in 0..9 {
                     values.push(String::new());
                 }
             }

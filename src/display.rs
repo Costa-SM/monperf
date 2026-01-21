@@ -775,41 +775,85 @@ pub fn render_network(f: &mut Frame, area: Rect, net: &NetworkMetrics, history: 
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(main_chunks[1]);
 
-    // Text information with colored RX/TX values, vertically aligned
-    // Use 6-char width for all values to align columns
+    // Get utilization and link speed from first interface if available
+    let (rx_util, tx_util, link_speed) = net.interfaces.first()
+        .map(|i| (i.rx_util_pct, i.tx_util_pct, i.link_speed_mbps))
+        .unwrap_or((None, None, None));
+    
+    // Text information with colored RX/TX values and utilization bars
     let rx_str = format_throughput_short(net.total_rx_bytes_per_sec);
     let tx_str = format_throughput_short(net.total_tx_bytes_per_sec);
     
+    // Helper to create a utilization bar
+    let make_util_bar = |pct: Option<f64>, bar_width: usize| -> Vec<Span> {
+        match pct {
+            Some(p) => {
+                let clamped = p.clamp(0.0, 100.0);
+                let filled = ((clamped / 100.0) * bar_width as f64).round() as usize;
+                let empty = bar_width.saturating_sub(filled);
+                let color = percentage_color(clamped, 50.0, 80.0);
+                vec![
+                    Span::raw("["),
+                    Span::styled("█".repeat(filled), Style::default().fg(color)),
+                    Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+                    Span::raw("]"),
+                    Span::styled(format!("{:>5.1}%", clamped), Style::default().fg(color)),
+                ]
+            }
+            None => vec![
+                Span::styled("[N/A]", Style::default().fg(Color::DarkGray)),
+            ]
+        }
+    };
+    
+    // Link speed string
+    let link_str = match link_speed {
+        Some(speed) if speed >= 1000 => format!(" @{}G", speed / 1000),
+        Some(speed) => format!(" @{}M", speed),
+        None => String::new(),
+    };
+    
+    // RX line with bar
+    let bar_width = 10;
+    let mut rx_spans = vec![
+        Span::raw("RX: "),
+        Span::styled(format!("{:>6}", rx_str), Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+    ];
+    rx_spans.extend(make_util_bar(rx_util, bar_width));
+    
+    // TX line with bar
+    let mut tx_spans = vec![
+        Span::raw("TX: "),
+        Span::styled(format!("{:>6}", tx_str), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+    ];
+    tx_spans.extend(make_util_bar(tx_util, bar_width));
+    tx_spans.push(Span::styled(link_str, Style::default().fg(Color::DarkGray)));
+    
     let mut lines = vec![
-        Line::from(vec![
-            Span::raw("Total: RX "),
-            Span::styled(format!("{:>6}", rx_str), Style::default().fg(Color::Cyan)),
-            Span::raw(" TX "),
-            Span::styled(format!("{:>6}", tx_str), Style::default().fg(Color::Green)),
-        ]),
+        Line::from(rx_spans),
+        Line::from(tx_spans),
     ];
 
-    // Show first interface details if available
+    // Show interface details on third line
     if let Some(iface) = net.interfaces.first() {
-        let rx_pkt = format!("{:>6.0}", iface.rx_packets_per_sec);
-        let tx_pkt = format!("{:>6.0}", iface.tx_packets_per_sec);
-        // Format: "iface: RX xxxxxx TX xxxxxx" - align "RX" with Total line
-        let iface_short: String = iface.interface.chars().take(5).collect();
         lines.push(Line::from(vec![
-            Span::raw(format!("{:>5}: RX ", iface_short)),
-            Span::styled(rx_pkt, Style::default().fg(Color::Cyan)),
-            Span::raw(" TX "),
-            Span::styled(tx_pkt, Style::default().fg(Color::Green)),
-            Span::raw(" pkt/s"),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw(format!("TCP: {} Retx: {}", 
-                net.tcp.connections_established,
-                net.tcp.retransmits_delta.unwrap_or(0)
-            )),
+            Span::styled(format!("{}: ", iface.interface), Style::default().fg(Color::DarkGray)),
+            Span::raw("TCP:"),
+            Span::styled(format!("{}", net.tcp.connections_established), Style::default().fg(Color::White)),
+            Span::raw(" Retx:"),
+            Span::styled(
+                format!("{}", net.tcp.retransmits_delta.unwrap_or(0)),
+                if net.tcp.retransmits_delta.unwrap_or(0) > 0 { 
+                    Style::default().fg(Color::Yellow) 
+                } else { 
+                    Style::default().fg(Color::White) 
+                }
+            ),
             if iface.rx_errors > 0 || iface.tx_errors > 0 || iface.rx_drops > 0 || iface.tx_drops > 0 {
                 Span::styled(
-                    format!("  Err: {}/{} Drop: {}/{}",
+                    format!(" Err:{}/{} Drop:{}/{}",
                         iface.rx_errors, iface.tx_errors, iface.rx_drops, iface.tx_drops
                     ),
                     Style::default().fg(Color::Red),

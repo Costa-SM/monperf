@@ -30,6 +30,15 @@ pub struct InterfaceStats {
     pub rx_bytes_total: u64,
     /// Total bytes transmitted
     pub tx_bytes_total: u64,
+    /// Link speed in Mbps (None if unavailable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_speed_mbps: Option<u64>,
+    /// RX utilization percentage (None if link speed unavailable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_util_pct: Option<f64>,
+    /// TX utilization percentage (None if link speed unavailable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_util_pct: Option<f64>,
 }
 
 /// Raw interface statistics
@@ -87,6 +96,30 @@ impl NetworkCollector {
         }
     }
 
+    /// Get the link speed for an interface in Mbps
+    /// Returns None if the speed cannot be determined (virtual interfaces, etc.)
+    fn get_link_speed(interface: &str) -> Option<u64> {
+        let speed_path = format!("/sys/class/net/{}/speed", interface);
+        fs::read_to_string(&speed_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|&speed| speed > 0)  // -1 means unknown, filter out invalid values
+            .map(|speed| speed as u64)
+    }
+
+    /// Calculate utilization percentage given throughput and link speed
+    fn calculate_util_pct(bytes_per_sec: f64, link_speed_mbps: Option<u64>) -> Option<f64> {
+        link_speed_mbps.map(|speed_mbps| {
+            // Convert Mbps to bytes/sec: Mbps * 1_000_000 / 8
+            let speed_bytes_per_sec = (speed_mbps as f64) * 1_000_000.0 / 8.0;
+            if speed_bytes_per_sec > 0.0 {
+                (bytes_per_sec / speed_bytes_per_sec) * 100.0
+            } else {
+                0.0
+            }
+        })
+    }
+
     /// Collect current network metrics
     pub fn collect(&mut self) -> Result<NetworkMetrics> {
         let now_ms = std::time::SystemTime::now()
@@ -138,10 +171,18 @@ impl NetworkCollector {
                     let rx_packets_delta = stats.rx_packets.saturating_sub(prev.rx_packets);
                     let tx_packets_delta = stats.tx_packets.saturating_sub(prev.tx_packets);
 
+                    let rx_bytes_per_sec = rx_bytes_delta as f64 / time_delta_sec;
+                    let tx_bytes_per_sec = tx_bytes_delta as f64 / time_delta_sec;
+
+                    // Get link speed and calculate utilization
+                    let link_speed_mbps = Self::get_link_speed(&interface);
+                    let rx_util_pct = Self::calculate_util_pct(rx_bytes_per_sec, link_speed_mbps);
+                    let tx_util_pct = Self::calculate_util_pct(tx_bytes_per_sec, link_speed_mbps);
+
                     interfaces.push(InterfaceStats {
                         interface: interface.clone(),
-                        rx_bytes_per_sec: rx_bytes_delta as f64 / time_delta_sec,
-                        tx_bytes_per_sec: tx_bytes_delta as f64 / time_delta_sec,
+                        rx_bytes_per_sec,
+                        tx_bytes_per_sec,
                         rx_packets_per_sec: rx_packets_delta as f64 / time_delta_sec,
                         tx_packets_per_sec: tx_packets_delta as f64 / time_delta_sec,
                         rx_errors: stats.rx_errors,
@@ -150,6 +191,9 @@ impl NetworkCollector {
                         tx_drops: stats.tx_drops,
                         rx_bytes_total: stats.rx_bytes,
                         tx_bytes_total: stats.tx_bytes,
+                        link_speed_mbps,
+                        rx_util_pct,
+                        tx_util_pct,
                     });
                 }
             }
